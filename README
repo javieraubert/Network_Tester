@@ -1,0 +1,35 @@
+High-performance UDP traffic generator for Windows with real-time statistics.  
+Designed for engineers, testers, and developers who need to measure network performance, latency, jitter, and packet loss at scale.
+
+For testing an learning purposes, not intended to be use on any comercial application.
+
+---
+
+## 🚀 Features
+
+- Multi-threaded high-performance UDP sender
+- Live statistics every 10 seconds (TX/RX, latency, jitter, packet loss)
+- Supports rate control in **Mbps** or **PPS**
+- Configurable payload size and pattern generation
+- Optional packet verification (echo mode)
+- Token bucket shaper for accurate traffic rate
+- Works smoothly on **Windows**
+
+---
+
+## 🧠 How It Works
+
+The script sends UDP packets containing a sequence number and timestamp header.  
+If a responder (loopback or echo server) sends them back, latency and jitter are calculated.  
+It uses a token bucket algorithm to regulate bandwidth and achieve consistent traffic rates.
+
+A responder script is provided as well.
+
+---
+
+## ⚙️ Usage
+
+### Basic Example
+
+```bash
+python3 sender.py 192.168.1.100 --port 9999 --mbps 750 --payload-size 512 --pattern prbs --flows 1 --verify --duration 10
