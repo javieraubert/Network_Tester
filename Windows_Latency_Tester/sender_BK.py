@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-sender.py
-High-performance UDP traffic generator for Windows with live stats and accurate PL/latency graphs.
+high_perf_udp_sender_win_live.py
+High-performance UDP traffic generator for Windows with live stats.
 """
 
 import argparse
@@ -13,7 +13,6 @@ import logging
 from typing import List, Set
 import threading
 import statistics
-import matplotlib.pyplot as plt
 
 HEADER_FMT = "!Qd"  # seq (uint64), timestamp (double)
 HEADER_SIZE = struct.calcsize(HEADER_FMT)
@@ -58,6 +57,10 @@ def pattern_bytes_from_spec(payload_size: int, spec: str) -> bytes:
     raise ValueError("Unknown pattern spec")
 
 # ---------------- helpers ----------------
+def build_packet(seq: int, payload: bytes) -> bytes:
+    ts = time.time()
+    return struct.pack(HEADER_FMT, seq, ts) + payload
+
 def calc_pps_from_mbps(mbps: float, total_packet_size: int) -> float:
     return (mbps * 1_000_000) / (total_packet_size * 8)
 
@@ -86,18 +89,30 @@ class TokenBucket:
         return (amount - available) / self.rate_bps
 
 # ---------------- sender thread ----------------
-def sender_thread(sock: socket.socket, target: str, port: int, payload: bytes,
-                  rate_bytes_per_sec: float, burst_bytes: int, duration_send: float,
-                  stats_dict: dict, thread_id: int):
+def sender_thread(target: str, port: int, payload: bytes, tos: int,
+                  rate_bytes_per_sec: float, burst_bytes: int, duration: float,
+                  verify: bool, stats_dict: dict, thread_id: int):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setblocking(False)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4*1024*1024)
+    if tos is not None:
+        try:
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_TOS, tos)
+        except Exception:
+            pass
+
     tb = TokenBucket(rate_bytes_per_sec, burst_bytes)
     seq = 0
     total_sent = 0
-    sent_seq_set: Set[int] = set()
+    total_failed = 0
+    rtt_list: List[float] = []
+    seq_received: Set[int] = set()
     start_time = time.time()
     packet_len = HEADER_SIZE + len(payload)
-    next_report = start_time + 10
 
-    while time.time() - start_time < duration_send:
+    next_report = start_time + 10  # first live report after 10s
+
+    while time.time() - start_time < duration:
         wait = tb.wait_time_for(packet_len)
         if wait > 0:
             time.sleep(wait)
@@ -105,48 +120,54 @@ def sender_thread(sock: socket.socket, target: str, port: int, payload: bytes,
         if not tb.consume(packet_len):
             time.sleep(0.00001)
             continue
-
         packet = struct.pack(HEADER_FMT, seq, time.time()) + payload
         try:
             sock.sendto(packet, (target, port))
             total_sent += 1
-            sent_seq_set.add(seq)
         except Exception:
-            pass
+            total_failed += 1
+
         seq = (seq + 1) & ((1 << 64) - 1)
 
-        # live report
+        if verify:
+            try:
+                sock.settimeout(0)
+                while True:
+                    data, addr = sock.recvfrom(65536)
+                    if not data:
+                        break
+                    try:
+                        r_seq, ts = struct.unpack(HEADER_FMT, data[:HEADER_SIZE])
+                    except Exception:
+                        continue
+                    rtt_list.append((time.time() - ts)*1000)
+                    seq_received.add(r_seq)
+            except (BlockingIOError, socket.timeout):
+                pass
+            except Exception:
+                pass
+
+        # live report cada 10s
         now = time.time()
         if now >= next_report:
-            print(f"[Live {int(now-start_time)}s] Sent={total_sent}")
+            if rtt_list:
+                latency_min = min(rtt_list)
+                latency_max = max(rtt_list)
+                latency_avg = statistics.mean(rtt_list)
+                jitter = statistics.stdev(rtt_list) if len(rtt_list)>1 else 0.0
+            else:
+                latency_min = latency_max = latency_avg = jitter = 0.0
+            print(f"\n[Live {int(now-start_time)}s] Sent={total_sent} PL={total_sent-len(seq_received)} "
+                  f"Min={latency_min:.2f}ms Max={latency_max:.2f}ms Avg={latency_avg:.2f}ms Jitter={jitter:.2f}ms")
             next_report += 10
 
-    stats_dict[thread_id] = (total_sent, sent_seq_set)
-
-# ---------------- receiver thread ----------------
-def receiver_thread(sock: socket.socket, duration_recv: float,
-                    stats_dict: dict, rtt_list: List[float], seq_received: Set[int], stop_event: threading.Event):
-    start_time = time.time()
-    while not stop_event.is_set() and time.time() - start_time < duration_recv:
-        try:
-            data, addr = sock.recvfrom(65536)
-            if not data:
-                continue
-            try:
-                r_seq, ts = struct.unpack(HEADER_FMT, data[:HEADER_SIZE])
-                rtt_list.append((time.time() - ts) * 1000)
-                seq_received.add(r_seq)
-            except Exception:
-                continue
-        except (BlockingIOError, socket.timeout):
-            time.sleep(0.001)
-        except Exception:
-            pass
+    sock.close()
+    stats_dict[thread_id] = (total_sent, total_failed, rtt_list, seq_received)
 
 # ---------------- top-level ----------------
 def run_high_perf_sender(target_host: str, target_port: int, pps: float, mbps: float,
-                         payload_size: int, pattern: str, flows: int,
-                         sndbuf: int, tos: int, duration: float, extra_time: float, local_port: int):
+                         payload_size: int, pattern: str, verify: bool,
+                         flows: int, sndbuf: int, tos: int, duration: float):
     total_packet_size = HEADER_SIZE + payload_size
     if mbps and pps:
         raise ValueError("Use either PPS or Mbps")
@@ -162,104 +183,55 @@ def run_high_perf_sender(target_host: str, target_port: int, pps: float, mbps: f
 
     payload = pattern_bytes_from_spec(payload_size, pattern)
 
-    # single socket for sending and receiving
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setblocking(False)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, sndbuf)
-    if tos is not None:
-        try:
-            sock.setsockopt(socket.IPPROTO_IP, socket.IP_TOS, tos)
-        except Exception:
-            pass
-    if local_port:
-        sock.bind(("", local_port))
-
-    # shared stats
-    stats_dict = {}
-    rtt_list: List[float] = []
-    seq_received: Set[int] = set()
-    stop_event = threading.Event()
-
-    # start receiver
-    recv_thread = threading.Thread(target=receiver_thread,
-                                   args=(sock, duration + extra_time, stats_dict, rtt_list, seq_received, stop_event))
-    recv_thread.start()
-
-    # start sender threads
     threads = []
+    stats_dict = {}
     for i in range(flows):
         t = threading.Thread(target=sender_thread,
-                             args=(sock, target_host, target_port, payload,
+                             args=(target_host, target_port, payload, tos,
                                    rate_bytes_per_sec/flows, burst_bytes//flows, duration,
-                                   stats_dict, i))
+                                   verify, stats_dict, i))
         t.start()
         threads.append(t)
 
     for t in threads:
         t.join()
 
-    # wait extra time for receiver
-    recv_thread.join()
-    sock.close()
-
     # ---------------- aggregate statistics ----------------
-    total_sent = 0
-    all_sent_seq: Set[int] = set()
+    total_sent = sum(v[0] for v in stats_dict.values())
+    total_failed = sum(v[1] for v in stats_dict.values())
+    all_rtt = [rtt for v in stats_dict.values() for rtt in v[2]]
+    all_seq_received = set()
+    total_rx_bytes = 0
     for v in stats_dict.values():
-        total_sent += v[0]
-        all_sent_seq.update(v[1])
+        all_seq_received.update(v[3])
+        total_rx_bytes += len(v[3]) * total_packet_size
 
-    packet_loss = len(all_sent_seq - seq_received)
-    loss_percent = (packet_loss / len(all_sent_seq) * 100) if all_sent_seq else 0.0
-    duration_actual = duration + extra_time
-    tx_mbps = (total_packet_size*8*total_sent)/duration/1_000_000
-    tx_pps = total_sent/duration
-    rx_mbps = (total_packet_size*8*len(seq_received))/duration_actual/1_000_000
-    rx_pps = len(seq_received)/duration_actual
+    packet_loss = total_sent - len(all_seq_received)
+    loss_percent = (packet_loss/total_sent*100) if total_sent else 0.0
+    duration_actual = duration if duration > 0 else 1.0
+    tx_mbps = (total_packet_size*8*total_sent)/duration_actual/1_000_000
+    tx_pps = total_sent/duration_actual
+    rx_mbps = (total_rx_bytes*8)/duration_actual/1_000_000
+    rx_pps = len(all_seq_received)/duration_actual
 
+    # ---------------- print final ----------------
     print("\nUDP Traffic Statistics (Final):")
     print(f"{'Metric':<25} {'Value'}")
     print(f"{'-'*40}")
     print(f"{'Total TX Packets':<25} {total_sent}")
-    print(f"{'Total RX Packets':<25} {len(seq_received)}")
+    print(f"{'Total RX Packets':<25} {len(all_seq_received)}")
     print(f"{'Packet Loss':<25} {packet_loss}")
     print(f"{'Packet Loss %':<25} {loss_percent:.2f}%")
     print(f"{'TX Mbps':<25} {tx_mbps:.3f}")
     print(f"{'TX PPS':<25} {tx_pps:.0f}")
     print(f"{'RX Mbps':<25} {rx_mbps:.3f}")
     print(f"{'RX PPS':<25} {rx_pps:.0f}")
-    if rtt_list:
-        print(f"{'Min Latency (ms)':<25} {min(rtt_list):.3f}")
-        print(f"{'Max Latency (ms)':<25} {max(rtt_list):.3f}")
-        print(f"{'Mean Latency (ms)':<25} {statistics.mean(rtt_list):.3f}")
-        if len(rtt_list) > 1:
-            print(f"{'Std/Jitter (ms)':<25} {statistics.stdev(rtt_list):.3f}")
-
-    # ---------------- plot graphs ----------------
-    plt.figure(figsize=(12,8))
-    plt.subplot(2,1,1)
-    plt.title("Packet Latency")
-    plt.plot(rtt_list, marker='.', linestyle='-', color='blue')
-    plt.xlabel("Packet (received)")
-    plt.ylabel("Latency ms")
-    plt.grid(True)
-
-    plt.subplot(2,1,2)
-    plt.title("Cumulative Packet Loss")
-    sorted_sent = sorted(all_sent_seq)
-    pl_cumulative = []
-    lost = 0
-    for s in sorted_sent:
-        if s not in seq_received:
-            lost += 1
-        pl_cumulative.append(lost)
-    plt.plot(pl_cumulative, marker='.', linestyle='-', color='red')
-    plt.xlabel("Packet index (sorted)")
-    plt.ylabel("Cumulative Packet Loss")
-    plt.grid(True)
-
-    plt.tight_layout()
-    plt.show()
+    if all_rtt:
+        print(f"{'Min Latency (ms)':<25} {min(all_rtt):.3f}")
+        print(f"{'Max Latency (ms)':<25} {max(all_rtt):.3f}")
+        print(f"{'Mean Latency (ms)':<25} {statistics.mean(all_rtt):.3f}")
+        if len(all_rtt) > 1:
+            print(f"{'Std/Jitter (ms)':<25} {statistics.stdev(all_rtt):.3f}")
 
 # ---------------- CLI ----------------
 def main():
@@ -270,12 +242,11 @@ def main():
     parser.add_argument("--mbps", type=float, default=None)
     parser.add_argument("--payload-size", type=int, default=64)
     parser.add_argument("--pattern", type=str, default="prbs")
+    parser.add_argument("--verify", action="store_true")
     parser.add_argument("--flows", type=int, default=1)
     parser.add_argument("--sndbuf", type=int, default=4*1024*1024)
     parser.add_argument("--tos", type=int, default=None)
     parser.add_argument("--duration", type=float, default=30, help="seconds")
-    parser.add_argument("--extra", type=float, default=5, help="extra seconds to keep receiver listening")
-    parser.add_argument("--local-port", type=int, default=0, help="local source port")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -283,8 +254,8 @@ def main():
                         format="%(asctime)s %(levelname)s %(message)s")
 
     run_high_perf_sender(args.host, args.port, args.pps or 0, args.mbps or 0,
-                         args.payload_size, args.pattern, args.flows,
-                         args.sndbuf, args.tos, args.duration, args.extra, args.local_port)
+                         args.payload_size, args.pattern, args.verify,
+                         args.flows, args.sndbuf, args.tos, args.duration)
 
 if __name__ == "__main__":
     main()
