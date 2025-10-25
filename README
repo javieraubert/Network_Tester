@@ -34,8 +34,8 @@ A responder script is provided as well.
 python3 sender.py 192.168.1.100 --port 9999 --mbps 750 --payload-size 512 --pattern prbs --flows 1 --verify --duration 10
 
 --host Destination IP or hostname.
---port: Destination port on the receiver (some receiver dont use it, but the sender still needs it, default=9999.
---local-port: local source port to bind (0 = auto),
+--port: Destination port on the receiver (some receiver dont use it, but the sender still needs it), default=9999.
+--local-port: local source port to bind (0 = auto).
 --pps: Amount of packets per second to be send.
 --mbps: Rate of the transmision.
 --payload-size: Payload size of the packet, without the headers.
