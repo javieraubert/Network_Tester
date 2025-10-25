@@ -1,18 +1,17 @@
 High-performance UDP traffic generator for Windows with real-time statistics.  
 Designed for engineers, testers, and developers who need to measure network performance, latency, jitter, and packet loss at scale.
 
-For testing an learning purposes, not intended to be use on any comercial application.
-
 ---
 
 ## 🚀 Features
 
 - Multi-threaded high-performance UDP sender
-- Live statistics every 10 seconds (TX/RX, latency, jitter, packet loss)
 - Supports rate control in **Mbps** or **PPS**
 - Configurable payload size and pattern generation
-- Optional packet verification (echo mode)
 - Token bucket shaper for accurate traffic rate
+- Packet loss and out of order counter
+- Jitter calculation according to RFC3550 and using standar deviation.
+- Latency, jitter and packet loss graph
 - Works smoothly on **Windows**
 
 ---
@@ -33,3 +32,17 @@ A responder script is provided as well.
 
 ```bash
 python3 sender.py 192.168.1.100 --port 9999 --mbps 750 --payload-size 512 --pattern prbs --flows 1 --verify --duration 10
+
+--host Destination IP or hostname.
+--port: Destination port on the receiver (some receiver dont use it, but the sender still needs it, default=9999.
+--local-port: local source port to bind (0 = auto),
+--pps: Amount of packets per second to be send.
+--mbps: Rate of the transmision.
+--payload-size: Payload size of the packet, without the headers.
+--pattern: Testing pattern of bits to be send.
+--flows: Amount of flows to be created between the sender and receiver.
+--sndbuf: Amount of memory in bytes, the operating system reserves for outgoing network data on a socket.
+--tos: Type of service.
+--duration: sending duration (seconds).
+--extra: extra seconds to keep receiver listening after send ends.
+--verbose: To print all the logs on the console.

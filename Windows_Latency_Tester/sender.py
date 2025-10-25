@@ -299,11 +299,11 @@ def run_high_perf_sender(target_host: str, target_port: int, pps: float, mbps: f
     print(f"{'Total RX Packets':<25} {len(all_recv_set)}")
     print(f"{'Packet Loss':<25} {packet_loss}")
     print(f"{'Packet Loss %':<25} {loss_percent:.2f}%")
+    print(f"{'Out-of-order pkts':<25} {ooo_counter['count']}")
     print(f"{'TX Mbps':<25} {tx_mbps:.3f}")
     print(f"{'TX PPS':<25} {tx_pps:.0f}")
     print(f"{'RX Mbps':<25} {rx_mbps:.3f}")
     print(f"{'RX PPS':<25} {rx_pps:.0f}")
-    print(f"{'Out-of-order pkts':<25} {ooo_counter['count']}")
     print(f"{'StdDev Jitter (ms)':<25} {std_jitter_ms:.3f}")
     print(f"{'RFC3550 Jitter (ms)':<25} {rfc_jitter_ms:.3f}")
     if all_rtts:
