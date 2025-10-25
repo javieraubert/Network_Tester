@@ -33,6 +33,8 @@ A responder script is provided as well.
 ```bash
 python3 sender.py 192.168.1.100 --port 9999 --mbps 750 --payload-size 512 --pattern prbs --flows 1 --verify --duration 10
 
+---
+
 ## ⚙️ Options
 
 --host Destination IP or hostname.
