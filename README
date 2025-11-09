@@ -31,7 +31,9 @@ A responder script is provided as well.
 ### Basic Example
 
 ```bash
-python3 sender.py 192.168.1.100 --port 9999 --mbps 750 --payload-size 512 --pattern prbs --flows 1 --verify --duration 10
+python3 sender.py 192.168.1.100 --port 9999 --mbps 750 --payload-size 512 --pattern prbs --flows 1 --duration 10
+
+python3 responder.py --host 192.168.1.100 --port 9999
 
 ---
 
