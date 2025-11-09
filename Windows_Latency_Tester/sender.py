@@ -7,6 +7,7 @@ UDP traffic generator for Windows with:
  - out-of-order detection
  - two jitter metrics: StdDev and RFC3550 smoothed jitter
  - final summary + latency, cumulative PL, and jitter graphs
+ - NEW: live throughput sampling every 5s (TX/RX Mbps) + speed vs time subplot
 """
 
 import argparse
@@ -97,7 +98,8 @@ class SeqGenerator:
 def sender_thread(sock: socket.socket, target: str, port: int, payload: bytes,
                   rate_bytes_per_sec: float, burst_bytes: int, duration_send: float,
                   seq_gen: SeqGenerator, sent_list: List[int], sent_lock: threading.Lock,
-                  stats_lock: threading.Lock, thread_id: int, verbose: bool):
+                  stats_lock: threading.Lock, thread_id: int, verbose: bool,
+                  tx_bytes_holder: dict, tx_lock: threading.Lock):
     tb = TokenBucket(rate_bytes_per_sec, burst_bytes)
     total_sent = 0
     total_failed = 0
@@ -120,8 +122,12 @@ def sender_thread(sock: socket.socket, target: str, port: int, payload: bytes,
         try:
             sock.sendto(packet, (target, port))
             total_sent += 1
+            # registrar secuencia enviada
             with sent_lock:
                 sent_list.append(seq)
+            # acumular bytes TX (header + payload)
+            with tx_lock:
+                tx_bytes_holder['bytes'] += len(packet)
         except Exception:
             total_failed += 1
 
@@ -138,7 +144,8 @@ def sender_thread(sock: socket.socket, target: str, port: int, payload: bytes,
 def receiver_thread(sock: socket.socket, duration_recv: float,
                     rtt_list: List[float], rtt_lock: threading.Lock,
                     seq_received: Set[int], recv_lock: threading.Lock,
-                    ooo_counter: dict, rfc_jitter_holder: dict, verbose: bool):
+                    ooo_counter: dict, rfc_jitter_holder: dict, verbose: bool,
+                    rx_bytes_holder: dict, rx_lock: threading.Lock):
     start_time = time.time()
     last_seq_seen = None
     prev_transit = None
@@ -155,6 +162,10 @@ def receiver_thread(sock: socket.socket, duration_recv: float,
                 seq_recv, send_ts = struct.unpack(HEADER_FMT, data[:HEADER_SIZE])
             except Exception:
                 continue
+
+            # acumular bytes RX reales
+            with rx_lock:
+                rx_bytes_holder['bytes'] += len(data)
 
             rtt_ms = (recv_ts - send_ts) * 1000.0
             with rtt_lock:
@@ -191,6 +202,64 @@ def receiver_thread(sock: socket.socket, duration_recv: float,
 
     # store instantaneous jitter for plotting
     rfc_jitter_holder['instantaneous'] = instantaneous_jitter_list
+
+# ---------------- monitor thread (5s sampling) ----------------
+def monitor_thread(duration_total: float,
+                   tx_bytes_holder: dict, rx_bytes_holder: dict,
+                   tx_lock: threading.Lock, rx_lock: threading.Lock,
+                   sample_period: float,
+                   speed_times: List[float], tx_series_mbps: List[float], rx_series_mbps: List[float],
+                   verbose: bool):
+    """
+    Mide TX/RX cada sample_period segundos y guarda Mbps de cada intervalo.
+    Imprime también en vivo.
+    """
+    t0 = time.time()
+    next_t = t0 + sample_period
+
+    # contadores previos para delta
+    with tx_lock:
+        prev_tx = tx_bytes_holder['bytes']
+    with rx_lock:
+        prev_rx = rx_bytes_holder['bytes']
+    prev_sample_time = t0
+
+    while True:
+        now = time.time()
+        if now >= next_t:
+            # calcular deltas
+            with tx_lock:
+                cur_tx = tx_bytes_holder['bytes']
+            with rx_lock:
+                cur_rx = rx_bytes_holder['bytes']
+
+            dt = now - prev_sample_time
+            dt = max(dt, 1e-6)
+
+            dtx = max(cur_tx - prev_tx, 0)
+            drx = max(cur_rx - prev_rx, 0)
+
+            tx_mbps = (dtx * 8) / (dt * 1_000_000)
+            rx_mbps = (drx * 8) / (dt * 1_000_000)
+
+            rel_time = now - t0
+            speed_times.append(rel_time)
+            tx_series_mbps.append(tx_mbps)
+            rx_series_mbps.append(rx_mbps)
+
+            if verbose:
+                print(f"[{int(rel_time)}s] TX={tx_mbps:.3f} Mbps | RX={rx_mbps:.3f} Mbps")
+
+            # preparar siguiente
+            prev_tx, prev_rx = cur_tx, cur_rx
+            prev_sample_time = now
+            next_t += sample_period
+
+        if now - t0 >= duration_total:
+            break
+
+        # dormir un poco para no ocupar CPU
+        time.sleep(0.05)
 
 # ---------------- top-level ----------------
 def run_high_perf_sender(target_host: str, target_port: int, pps: float, mbps: float,
@@ -240,18 +309,38 @@ def run_high_perf_sender(target_host: str, target_port: int, pps: float, mbps: f
     ooo_counter = {'count': 0}
     rfc_jitter_holder = {'jitter': 0.0}
 
+    # NUEVO: contadores de bytes y series de velocidad
+    tx_bytes_holder = {'bytes': 0}
+    rx_bytes_holder = {'bytes': 0}
+    tx_lock = threading.Lock()
+    rx_lock = threading.Lock()
+    speed_times: List[float] = []
+    tx_series_mbps: List[float] = []
+    rx_series_mbps: List[float] = []
+    sample_period = 5.0
+    total_runtime = duration + extra
+
     recv_thread = threading.Thread(target=receiver_thread,
                                    args=(sock, duration + extra, rtt_list, rtt_lock,
-                                         seq_received, recv_lock, ooo_counter, rfc_jitter_holder, verbose))
+                                         seq_received, recv_lock, ooo_counter, rfc_jitter_holder, verbose,
+                                         rx_bytes_holder, rx_lock))
     recv_thread.daemon = True
     recv_thread.start()
+
+    mon_thread = threading.Thread(target=monitor_thread,
+                                  args=(total_runtime, tx_bytes_holder, rx_bytes_holder,
+                                        tx_lock, rx_lock, sample_period,
+                                        speed_times, tx_series_mbps, rx_series_mbps, verbose))
+    mon_thread.daemon = True
+    mon_thread.start()
 
     send_threads = []
     for i in range(flows):
         t = threading.Thread(target=sender_thread,
                              args=(sock, target_host, target_port, payload,
                                    rate_bytes_per_sec / flows, burst_bytes // flows,
-                                   duration, seq_gen, sent_list, sent_lock, stats_lock, i, verbose))
+                                   duration, seq_gen, sent_list, sent_lock, stats_lock, i, verbose,
+                                   tx_bytes_holder, tx_lock))
         t.daemon = False
         t.start()
         send_threads.append(t)
@@ -260,6 +349,7 @@ def run_high_perf_sender(target_host: str, target_port: int, pps: float, mbps: f
         t.join()
 
     recv_thread.join()
+    mon_thread.join()
     sock.close()
 
     total_sent = 0
@@ -282,9 +372,9 @@ def run_high_perf_sender(target_host: str, target_port: int, pps: float, mbps: f
     duration_actual_send = duration if duration > 0 else 1.0
     duration_actual_recv = duration + extra if (duration + extra) > 0 else 1.0
 
-    tx_mbps = (total_packet_size * 8 * total_sent) / duration_actual_send / 1_000_000
+    tx_mbps_avg = (total_packet_size * 8 * total_sent) / duration_actual_send / 1_000_000
     tx_pps = total_sent / duration_actual_send
-    rx_mbps = (total_packet_size * 8 * len(all_recv_set)) / duration_actual_recv / 1_000_000
+    rx_mbps_avg = (total_packet_size * 8 * len(all_recv_set)) / duration_actual_recv / 1_000_000
     rx_pps = len(all_recv_set) / duration_actual_recv
 
     std_jitter_ms = statistics.stdev(all_rtts) if len(all_rtts) > 1 else 0.0
@@ -300,9 +390,9 @@ def run_high_perf_sender(target_host: str, target_port: int, pps: float, mbps: f
     print(f"{'Packet Loss':<25} {packet_loss}")
     print(f"{'Packet Loss %':<25} {loss_percent:.2f}%")
     print(f"{'Out-of-order pkts':<25} {ooo_counter['count']}")
-    print(f"{'TX Mbps':<25} {tx_mbps:.3f}")
+    print(f"{'TX Mbps (avg)':<25} {tx_mbps_avg:.3f}")
     print(f"{'TX PPS':<25} {tx_pps:.0f}")
-    print(f"{'RX Mbps':<25} {rx_mbps:.3f}")
+    print(f"{'RX Mbps (avg)':<25} {rx_mbps_avg:.3f}")
     print(f"{'RX PPS':<25} {rx_pps:.0f}")
     print(f"{'StdDev Jitter (ms)':<25} {std_jitter_ms:.3f}")
     print(f"{'RFC3550 Jitter (ms)':<25} {rfc_jitter_ms:.3f}")
@@ -336,7 +426,7 @@ def run_high_perf_sender(target_host: str, target_port: int, pps: float, mbps: f
     axs[1,0].grid(True)
     axs[1,0].legend()
 
-    # Column 2
+    # Column 2 (jitter)
     axs[0,1].plot(inst_jitter, linestyle='-', linewidth=0.8, color='orange', label='Instantaneous jitter')
     axs[0,1].plot([x*1000.0 for x in [rfc_jitter_s]*len(inst_jitter)], linestyle='-', linewidth=0.8, color='blue', label='RFC3550 smoothed jitter')
     axs[0,1].set_title("Jitter (ms)")
@@ -345,8 +435,14 @@ def run_high_perf_sender(target_host: str, target_port: int, pps: float, mbps: f
     axs[0,1].grid(True)
     axs[0,1].legend()
 
-    # empty placeholder for future subplot
-    axs[1,1].axis('off')
+    # NEW subplot: speed vs time
+    axs[1,1].plot(speed_times, tx_series_mbps, linestyle='-', linewidth=0.9, label='TX Mbps (5s)')
+    axs[1,1].plot(speed_times, rx_series_mbps, linestyle='-', linewidth=0.9, label='RX Mbps (5s)')
+    axs[1,1].set_title("Throughput vs Time (5 s bins)")
+    axs[1,1].set_xlabel("Time (s)")
+    axs[1,1].set_ylabel("Mbps")
+    axs[1,1].grid(True)
+    axs[1,1].legend()
 
     plt.tight_layout()
     plt.show()
